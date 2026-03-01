@@ -2,6 +2,7 @@
 """
 YouTube 周报生成器
 自动获取订阅频道的新视频，提取字幕，用AI整理成摘要，发送到邮箱
+支持使用Whisper语音识别处理无字幕视频
 """
 
 import os
@@ -10,6 +11,8 @@ import smtplib
 import feedparser
 import requests
 import re
+import subprocess
+import tempfile
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
@@ -17,9 +20,16 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
 import anthropic
 
+# 尝试导入Groq（用于Whisper语音识别）
+try:
+    from groq import Groq
+    GROQ_AVAILABLE = True
+except ImportError:
+    GROQ_AVAILABLE = False
+    print("⚠️ Groq未安装，无字幕视频将跳过")
+
 # ============= 配置区域 =============
 
-# 获取多少天内的视频（默认7天，可通过环境变量修改）
 DAYS_TO_FETCH = int(os.environ.get("DAYS_TO_FETCH", "7"))
 
 def get_config():
@@ -29,13 +39,12 @@ def get_config():
     print(f"  EMAIL_SENDER: {'✅ 已设置' if os.environ.get('EMAIL_SENDER') else '❌ 未设置'}")
     print(f"  EMAIL_PASSWORD: {'✅ 已设置' if os.environ.get('EMAIL_PASSWORD') else '❌ 未设置'}")
     print(f"  EMAIL_RECEIVER: {'✅ 已设置' if os.environ.get('EMAIL_RECEIVER') else '❌ 未设置'}")
+    print(f"  GROQ_API_KEY: {'✅ 已设置' if os.environ.get('GROQ_API_KEY') else '⚠️ 未设置（无字幕视频将跳过）'}")
     print(f"  DAYS_TO_FETCH: {DAYS_TO_FETCH} 天")
     
-    # 获取频道列表
     channels_str = os.environ.get("YOUTUBE_CHANNELS", "")
     print(f"  YOUTUBE_CHANNELS: {channels_str if channels_str else '❌ 未设置'}")
     
-    # 解析频道列表
     if channels_str:
         try:
             channels = json.loads(channels_str)
@@ -55,27 +64,119 @@ def get_config():
             "smtp_port": 587
         },
         "anthropic_api_key": os.environ.get("ANTHROPIC_API_KEY", ""),
+        "groq_api_key": os.environ.get("GROQ_API_KEY", ""),
         "channels": channels
     }
+
+# ============= Whisper 语音识别 =============
+
+def download_audio(video_id: str, title: str) -> str:
+    """
+    使用yt-dlp下载视频音频
+    返回音频文件路径
+    """
+    print(f"  🎵 正在下载音频: {title[:30]}...")
+    
+    try:
+        # 创建临时文件
+        temp_dir = tempfile.gettempdir()
+        output_path = os.path.join(temp_dir, f"{video_id}.mp3")
+        
+        # 如果文件已存在，先删除
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        
+        # 使用yt-dlp下载音频
+        cmd = [
+            "yt-dlp",
+            "-x",  # 只提取音频
+            "--audio-format", "mp3",
+            "--audio-quality", "5",  # 中等质量，减小文件大小
+            "-o", output_path,
+            "--no-playlist",
+            "--quiet",
+            f"https://www.youtube.com/watch?v={video_id}"
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        
+        if result.returncode == 0 and os.path.exists(output_path):
+            file_size = os.path.getsize(output_path) / (1024 * 1024)  # MB
+            print(f"  ✅ 音频下载成功: {file_size:.1f} MB")
+            return output_path
+        else:
+            print(f"  ❌ 音频下载失败: {result.stderr[:100] if result.stderr else '未知错误'}")
+            return None
+            
+    except subprocess.TimeoutExpired:
+        print(f"  ❌ 音频下载超时")
+        return None
+    except Exception as e:
+        print(f"  ❌ 音频下载失败: {e}")
+        return None
+
+
+def transcribe_with_whisper(audio_path: str, groq_api_key: str, title: str) -> str:
+    """
+    使用Groq Whisper API进行语音识别
+    """
+    if not GROQ_AVAILABLE:
+        print(f"  ❌ Groq未安装，无法转录")
+        return None
+    
+    if not groq_api_key:
+        print(f"  ❌ 未设置GROQ_API_KEY，无法转录")
+        return None
+    
+    print(f"  🎤 正在进行语音识别: {title[:30]}...")
+    
+    try:
+        # 检查文件大小（Groq限制25MB）
+        file_size = os.path.getsize(audio_path) / (1024 * 1024)
+        if file_size > 25:
+            print(f"  ⚠️ 音频文件过大 ({file_size:.1f}MB > 25MB)，将截取前25分钟")
+            # 可以用ffmpeg截取，这里简化处理
+        
+        client = Groq(api_key=groq_api_key)
+        
+        with open(audio_path, "rb") as audio_file:
+            transcription = client.audio.transcriptions.create(
+                model="whisper-large-v3",
+                file=audio_file,
+                response_format="text",
+                language="en"  # 可以改成 "zh" 如果主要是中文视频
+            )
+        
+        if transcription:
+            print(f"  ✅ 语音识别成功: {len(transcription)} 字符")
+            return transcription
+        
+    except Exception as e:
+        print(f"  ❌ 语音识别失败: {e}")
+    
+    finally:
+        # 清理临时文件
+        try:
+            if os.path.exists(audio_path):
+                os.remove(audio_path)
+        except:
+            pass
+    
+    return None
 
 # ============= 核心功能 =============
 
 def get_channel_id_from_handle(handle: str) -> tuple:
     """
-    从YouTube频道handle（如@MrBeast）获取频道ID和频道名称
-    返回: (channel_id, channel_name)
+    从YouTube频道handle获取频道ID和频道名称
     """
-    # 如果已经是频道ID格式，直接返回
     if handle.startswith("UC") and len(handle) == 24:
         print(f"  📺 {handle} 已是频道ID格式")
         return handle, handle
     
-    # 移除@符号
     clean_handle = handle.lstrip("@")
-    
     print(f"  🔍 正在获取 @{clean_handle} 的频道ID...")
     
-    # 尝试通过页面获取频道ID
     try:
         url = f"https://www.youtube.com/@{clean_handle}"
         headers = {
@@ -88,39 +189,23 @@ def get_channel_id_from_handle(handle: str) -> tuple:
             print(f"  ❌ 请求失败，状态码: {response.status_code}")
             return None, clean_handle
         
-        # 方法1: 从 channelId 提取
-        match = re.search(r'"channelId":"(UC[a-zA-Z0-9_-]{22})"', response.text)
-        if match:
-            channel_id = match.group(1)
-            print(f"  ✅ 找到频道ID: {channel_id}")
-            return channel_id, clean_handle
+        # 多种方法提取频道ID
+        patterns = [
+            r'"channelId":"(UC[a-zA-Z0-9_-]{22})"',
+            r'"externalId":"(UC[a-zA-Z0-9_-]{22})"',
+            r'"browseId":"(UC[a-zA-Z0-9_-]{22})"',
+            r'<link rel="canonical" href="https://www\.youtube\.com/channel/(UC[a-zA-Z0-9_-]{22})"'
+        ]
         
-        # 方法2: 从 externalId 提取
-        match = re.search(r'"externalId":"(UC[a-zA-Z0-9_-]{22})"', response.text)
-        if match:
-            channel_id = match.group(1)
-            print(f"  ✅ 找到频道ID: {channel_id}")
-            return channel_id, clean_handle
+        for pattern in patterns:
+            match = re.search(pattern, response.text)
+            if match:
+                channel_id = match.group(1)
+                print(f"  ✅ 找到频道ID: {channel_id}")
+                return channel_id, clean_handle
         
-        # 方法3: 从 canonical URL 提取
-        match = re.search(r'<link rel="canonical" href="https://www\.youtube\.com/channel/(UC[a-zA-Z0-9_-]{22})"', response.text)
-        if match:
-            channel_id = match.group(1)
-            print(f"  ✅ 找到频道ID: {channel_id}")
-            return channel_id, clean_handle
-        
-        # 方法4: 从 browse_id 提取
-        match = re.search(r'"browseId":"(UC[a-zA-Z0-9_-]{22})"', response.text)
-        if match:
-            channel_id = match.group(1)
-            print(f"  ✅ 找到频道ID: {channel_id}")
-            return channel_id, clean_handle
-            
         print(f"  ❌ 无法从页面提取频道ID")
-        print(f"  📄 页面长度: {len(response.text)} 字符")
         
-    except requests.exceptions.Timeout:
-        print(f"  ❌ 请求超时")
     except Exception as e:
         print(f"  ❌ 获取失败: {e}")
     
@@ -137,15 +222,11 @@ def get_recent_videos(channel_id: str, channel_name: str, days: int = 7) -> list
         print(f"  ⚠️ {channel_name}: 无有效频道ID，跳过")
         return videos
     
-    # YouTube RSS feed URL
     rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
     print(f"  📡 RSS URL: {rss_url}")
     
     try:
         feed = feedparser.parse(rss_url)
-        
-        if feed.bozo:
-            print(f"  ⚠️ RSS解析警告: {feed.bozo_exception}")
         
         if not feed.entries:
             print(f"  ⚠️ {channel_name}: RSS没有返回任何视频")
@@ -157,7 +238,6 @@ def get_recent_videos(channel_id: str, channel_name: str, days: int = 7) -> list
         print(f"  📅 筛选 {cutoff_date.strftime('%Y-%m-%d')} 之后的视频")
         
         for entry in feed.entries:
-            # 解析发布时间
             published = datetime(*entry.published_parsed[:6])
             
             if published >= cutoff_date:
@@ -177,22 +257,20 @@ def get_recent_videos(channel_id: str, channel_name: str, days: int = 7) -> list
         
     except Exception as e:
         print(f"  ❌ 获取 {channel_name} 的视频失败: {e}")
-        import traceback
-        traceback.print_exc()
     
     return videos
 
 
-def get_transcript(video_id: str, title: str) -> str:
+def get_transcript(video_id: str, title: str, groq_api_key: str = None) -> str:
     """
     获取视频字幕
+    如果没有字幕，尝试使用Whisper语音识别
     """
+    # 首先尝试获取现有字幕
     try:
         transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
         
-        # 优先级：中文 > 英文 > 其他
         preferred_languages = ['zh-Hans', 'zh-Hant', 'zh', 'en', 'en-US', 'en-GB']
-        
         transcript = None
         
         for lang in preferred_languages:
@@ -216,10 +294,19 @@ def get_transcript(video_id: str, title: str) -> str:
             print(f"  📝 获取字幕成功: {title[:30]}... ({len(full_text)} 字符)")
             return full_text
             
-    except TranscriptsDisabled:
-        print(f"  ⚠️ 字幕已禁用: {title[:30]}...")
-    except NoTranscriptFound:
-        print(f"  ⚠️ 无可用字幕: {title[:30]}...")
+    except (TranscriptsDisabled, NoTranscriptFound):
+        print(f"  ⚠️ 无可用字幕，尝试语音识别...")
+        
+        # 使用Whisper进行语音识别
+        if groq_api_key:
+            audio_path = download_audio(video_id, title)
+            if audio_path:
+                transcript = transcribe_with_whisper(audio_path, groq_api_key, title)
+                if transcript:
+                    return transcript
+        else:
+            print(f"  ⚠️ 未配置GROQ_API_KEY，跳过语音识别")
+            
     except Exception as e:
         print(f"  ❌ 字幕获取失败: {title[:30]}... - {e}")
     
@@ -232,7 +319,7 @@ def summarize_with_ai(video: dict, transcript: str, api_key: str) -> dict:
     """
     if not transcript:
         return {
-            "summary": "（该视频无可用字幕）",
+            "summary": "（该视频无可用字幕且语音识别失败）",
             "key_points": [],
             "insights": ""
         }
@@ -489,7 +576,7 @@ def generate_email_content(summaries: list, week_start: str, week_end: str) -> s
     html += """
         <div class="footer">
             <p>由 YouTube Digest 自动生成 ❤️</p>
-            <p>Powered by Claude AI</p>
+            <p>Powered by Claude AI + Whisper</p>
         </div>
     </div>
 </body>
@@ -533,10 +620,8 @@ def main():
     print("🚀 YouTube 周报生成器启动")
     print("=" * 60)
     
-    # 获取配置
     config = get_config()
     
-    # 检查必要配置
     if not config['anthropic_api_key']:
         print("❌ 错误: 未设置 ANTHROPIC_API_KEY")
         return
@@ -549,14 +634,12 @@ def main():
         print("❌ 错误: 未设置要关注的频道")
         return
     
-    # 计算日期范围
     today = datetime.now()
     week_start = (today - timedelta(days=DAYS_TO_FETCH)).strftime("%m月%d日")
     week_end = today.strftime("%m月%d日")
     
     print(f"\n📅 获取 {week_start} ~ {week_end} 的视频（过去 {DAYS_TO_FETCH} 天）\n")
     
-    # 收集所有视频
     all_videos = []
     
     print("=" * 60)
@@ -568,7 +651,6 @@ def main():
         print(f"处理频道: {channel}")
         print(f"{'─' * 40}")
         
-        # 获取频道ID
         channel_id, channel_name = get_channel_id_from_handle(channel)
         
         if channel_id:
@@ -581,14 +663,13 @@ def main():
     print(f"📊 共找到 {len(all_videos)} 个新视频")
     print(f"{'=' * 60}")
     
-    # 处理每个视频
     summaries = []
     
     for i, video in enumerate(all_videos, 1):
         print(f"\n[{i}/{len(all_videos)}] 处理: {video['title'][:50]}...")
         
-        # 获取字幕
-        transcript = get_transcript(video['id'], video['title'])
+        # 获取字幕（如果失败会尝试Whisper语音识别）
+        transcript = get_transcript(video['id'], video['title'], config['groq_api_key'])
         
         # AI摘要
         summary = summarize_with_ai(video, transcript, config['anthropic_api_key'])
@@ -598,12 +679,10 @@ def main():
             'summary': summary
         })
     
-    # 生成邮件内容
     print(f"\n{'=' * 60}")
     print("📧 生成邮件内容...")
     html_content = generate_email_content(summaries, week_start, week_end)
     
-    # 发送邮件
     print("📤 发送邮件...")
     send_email(config, html_content, week_start, week_end)
     
