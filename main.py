@@ -9,6 +9,7 @@ import json
 import smtplib
 import feedparser
 import requests
+import re
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
@@ -17,16 +18,18 @@ from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFoun
 import anthropic
 
 # ============= 配置区域 =============
-# 这些值会从环境变量读取（在GitHub Secrets中设置）
+
+# 获取多少天内的视频（默认7天，可通过环境变量修改）
+DAYS_TO_FETCH = int(os.environ.get("DAYS_TO_FETCH", "7"))
 
 def get_config():
     """从环境变量获取配置"""
-    # 调试：打印环境变量状态
     print("🔍 检查环境变量...")
-    print(f"  ANTHROPIC_API_KEY: {'已设置' if os.environ.get('ANTHROPIC_API_KEY') else '❌ 未设置'}")
-    print(f"  EMAIL_SENDER: {'已设置' if os.environ.get('EMAIL_SENDER') else '❌ 未设置'}")
-    print(f"  EMAIL_PASSWORD: {'已设置' if os.environ.get('EMAIL_PASSWORD') else '❌ 未设置'}")
-    print(f"  EMAIL_RECEIVER: {'已设置' if os.environ.get('EMAIL_RECEIVER') else '❌ 未设置'}")
+    print(f"  ANTHROPIC_API_KEY: {'✅ 已设置' if os.environ.get('ANTHROPIC_API_KEY') else '❌ 未设置'}")
+    print(f"  EMAIL_SENDER: {'✅ 已设置' if os.environ.get('EMAIL_SENDER') else '❌ 未设置'}")
+    print(f"  EMAIL_PASSWORD: {'✅ 已设置' if os.environ.get('EMAIL_PASSWORD') else '❌ 未设置'}")
+    print(f"  EMAIL_RECEIVER: {'✅ 已设置' if os.environ.get('EMAIL_RECEIVER') else '❌ 未设置'}")
+    print(f"  DAYS_TO_FETCH: {DAYS_TO_FETCH} 天")
     
     # 获取频道列表
     channels_str = os.environ.get("YOUTUBE_CHANNELS", "")
@@ -36,9 +39,9 @@ def get_config():
     if channels_str:
         try:
             channels = json.loads(channels_str)
+            print(f"  ✅ 解析到 {len(channels)} 个频道")
         except json.JSONDecodeError as e:
             print(f"  ❌ YOUTUBE_CHANNELS 格式错误: {e}")
-            print(f"  收到的值: '{channels_str}'")
             channels = []
     else:
         channels = []
@@ -57,55 +60,101 @@ def get_config():
 
 # ============= 核心功能 =============
 
-def get_channel_id_from_handle(handle: str) -> str:
+def get_channel_id_from_handle(handle: str) -> tuple:
     """
-    从YouTube频道handle（如@MrBeast）获取频道ID
-    这是因为RSS需要频道ID而不是handle
+    从YouTube频道handle（如@MrBeast）获取频道ID和频道名称
+    返回: (channel_id, channel_name)
     """
     # 如果已经是频道ID格式，直接返回
-    if handle.startswith("UC"):
-        return handle
+    if handle.startswith("UC") and len(handle) == 24:
+        print(f"  📺 {handle} 已是频道ID格式")
+        return handle, handle
     
     # 移除@符号
-    handle = handle.lstrip("@")
+    clean_handle = handle.lstrip("@")
     
-    # 尝试通过页面获取频道ID（免费方法）
+    print(f"  🔍 正在获取 @{clean_handle} 的频道ID...")
+    
+    # 尝试通过页面获取频道ID
     try:
-        url = f"https://www.youtube.com/@{handle}"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        response = requests.get(url, headers=headers, timeout=10)
+        url = f"https://www.youtube.com/@{clean_handle}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9"
+        }
+        response = requests.get(url, headers=headers, timeout=15)
         
-        # 从页面中提取频道ID
-        if 'channel_id' in response.text:
-            import re
-            match = re.search(r'"channelId":"(UC[^"]+)"', response.text)
-            if match:
-                return match.group(1)
+        if response.status_code != 200:
+            print(f"  ❌ 请求失败，状态码: {response.status_code}")
+            return None, clean_handle
         
-        # 备用方法：从canonical URL提取
-        match = re.search(r'<link rel="canonical" href="https://www\.youtube\.com/channel/(UC[^"]+)"', response.text)
+        # 方法1: 从 channelId 提取
+        match = re.search(r'"channelId":"(UC[a-zA-Z0-9_-]{22})"', response.text)
         if match:
-            return match.group(1)
+            channel_id = match.group(1)
+            print(f"  ✅ 找到频道ID: {channel_id}")
+            return channel_id, clean_handle
+        
+        # 方法2: 从 externalId 提取
+        match = re.search(r'"externalId":"(UC[a-zA-Z0-9_-]{22})"', response.text)
+        if match:
+            channel_id = match.group(1)
+            print(f"  ✅ 找到频道ID: {channel_id}")
+            return channel_id, clean_handle
+        
+        # 方法3: 从 canonical URL 提取
+        match = re.search(r'<link rel="canonical" href="https://www\.youtube\.com/channel/(UC[a-zA-Z0-9_-]{22})"', response.text)
+        if match:
+            channel_id = match.group(1)
+            print(f"  ✅ 找到频道ID: {channel_id}")
+            return channel_id, clean_handle
+        
+        # 方法4: 从 browse_id 提取
+        match = re.search(r'"browseId":"(UC[a-zA-Z0-9_-]{22})"', response.text)
+        if match:
+            channel_id = match.group(1)
+            print(f"  ✅ 找到频道ID: {channel_id}")
+            return channel_id, clean_handle
             
+        print(f"  ❌ 无法从页面提取频道ID")
+        print(f"  📄 页面长度: {len(response.text)} 字符")
+        
+    except requests.exceptions.Timeout:
+        print(f"  ❌ 请求超时")
     except Exception as e:
-        print(f"⚠️ 无法获取 @{handle} 的频道ID: {e}")
+        print(f"  ❌ 获取失败: {e}")
     
-    return None
+    return None, clean_handle
 
 
 def get_recent_videos(channel_id: str, channel_name: str, days: int = 7) -> list:
     """
     通过RSS获取频道最近的视频
-    这是完全免费的方法，不需要API密钥
     """
     videos = []
     
+    if not channel_id:
+        print(f"  ⚠️ {channel_name}: 无有效频道ID，跳过")
+        return videos
+    
     # YouTube RSS feed URL
     rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+    print(f"  📡 RSS URL: {rss_url}")
     
     try:
         feed = feedparser.parse(rss_url)
+        
+        if feed.bozo:
+            print(f"  ⚠️ RSS解析警告: {feed.bozo_exception}")
+        
+        if not feed.entries:
+            print(f"  ⚠️ {channel_name}: RSS没有返回任何视频")
+            return videos
+        
+        print(f"  📋 RSS返回 {len(feed.entries)} 个视频条目")
+        
         cutoff_date = datetime.now() - timedelta(days=days)
+        print(f"  📅 筛选 {cutoff_date.strftime('%Y-%m-%d')} 之后的视频")
         
         for entry in feed.entries:
             # 解析发布时间
@@ -120,11 +169,16 @@ def get_recent_videos(channel_id: str, channel_name: str, days: int = 7) -> list
                     "published": published.strftime("%Y-%m-%d"),
                     "url": f"https://www.youtube.com/watch?v={video_id}"
                 })
+                print(f"    ✅ {entry.title[:40]}... ({published.strftime('%Y-%m-%d')})")
+            else:
+                print(f"    ⏭️ 跳过旧视频: {entry.title[:30]}... ({published.strftime('%Y-%m-%d')})")
         
-        print(f"✅ {channel_name}: 找到 {len(videos)} 个新视频")
+        print(f"  📊 {channel_name}: 找到 {len(videos)} 个符合条件的新视频")
         
     except Exception as e:
-        print(f"❌ 获取 {channel_name} 的视频失败: {e}")
+        print(f"  ❌ 获取 {channel_name} 的视频失败: {e}")
+        import traceback
+        traceback.print_exc()
     
     return videos
 
@@ -132,10 +186,8 @@ def get_recent_videos(channel_id: str, channel_name: str, days: int = 7) -> list
 def get_transcript(video_id: str, title: str) -> str:
     """
     获取视频字幕
-    优先获取中文，其次英文，最后任何可用语言
     """
     try:
-        # 尝试获取字幕列表
         transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
         
         # 优先级：中文 > 英文 > 其他
@@ -143,7 +195,6 @@ def get_transcript(video_id: str, title: str) -> str:
         
         transcript = None
         
-        # 尝试按优先级获取
         for lang in preferred_languages:
             try:
                 transcript = transcript_list.find_transcript([lang])
@@ -151,21 +202,18 @@ def get_transcript(video_id: str, title: str) -> str:
             except:
                 continue
         
-        # 如果没有找到优先语言，获取任何可用的
         if transcript is None:
             try:
                 transcript = transcript_list.find_generated_transcript(['zh', 'en'])
             except:
-                # 获取第一个可用的字幕
                 for t in transcript_list:
                     transcript = t
                     break
         
         if transcript:
-            # 获取字幕内容
             transcript_data = transcript.fetch()
             full_text = " ".join([item['text'] for item in transcript_data])
-            print(f"  📝 获取字幕成功: {title[:30]}...")
+            print(f"  📝 获取字幕成功: {title[:30]}... ({len(full_text)} 字符)")
             return full_text
             
     except TranscriptsDisabled:
@@ -189,7 +237,6 @@ def summarize_with_ai(video: dict, transcript: str, api_key: str) -> dict:
             "insights": ""
         }
     
-    # 如果字幕太长，截取前面部分（大约2万字）
     max_length = 20000
     if len(transcript) > max_length:
         transcript = transcript[:max_length] + "..."
@@ -228,11 +275,8 @@ def summarize_with_ai(video: dict, transcript: str, api_key: str) -> dict:
             ]
         )
         
-        # 解析返回的JSON
         response_text = message.content[0].text
         
-        # 尝试提取JSON部分
-        import re
         json_match = re.search(r'\{[\s\S]*\}', response_text)
         if json_match:
             result = json.loads(json_match.group())
@@ -393,7 +437,6 @@ def generate_email_content(summaries: list, week_start: str, week_end: str) -> s
         </div>
 """
     else:
-        # 统计信息
         channels = set(s['video']['channel'] for s in summaries)
         html += f"""
         <div class="stats">
@@ -408,7 +451,6 @@ def generate_email_content(summaries: list, week_start: str, week_end: str) -> s
         </div>
 """
         
-        # 按频道分组
         for summary_data in summaries:
             video = summary_data['video']
             summary = summary_data['summary']
@@ -422,7 +464,6 @@ def generate_email_content(summaries: list, week_start: str, week_end: str) -> s
             <div class="summary">{summary.get('summary', '无摘要')}</div>
 """
             
-            # 关键要点
             if summary.get('key_points'):
                 html += """
             <div class="key-points">
@@ -436,7 +477,6 @@ def generate_email_content(summaries: list, week_start: str, week_end: str) -> s
             </div>
 """
             
-            # 洞察
             if summary.get('insights'):
                 html += f"""
             <div class="insight">{summary['insights']}</div>
@@ -470,7 +510,6 @@ def send_email(config: dict, html_content: str, week_start: str, week_end: str):
     msg['From'] = email_config['sender']
     msg['To'] = email_config['receiver']
     
-    # 添加HTML内容
     html_part = MIMEText(html_content, 'html', 'utf-8')
     msg.attach(html_part)
     
@@ -490,9 +529,9 @@ def main():
     """
     主函数
     """
-    print("=" * 50)
+    print("=" * 60)
     print("🚀 YouTube 周报生成器启动")
-    print("=" * 50)
+    print("=" * 60)
     
     # 获取配置
     config = get_config()
@@ -512,34 +551,41 @@ def main():
     
     # 计算日期范围
     today = datetime.now()
-    week_start = (today - timedelta(days=7)).strftime("%m月%d日")
+    week_start = (today - timedelta(days=DAYS_TO_FETCH)).strftime("%m月%d日")
     week_end = today.strftime("%m月%d日")
     
-    print(f"\n📅 获取 {week_start} ~ {week_end} 的视频\n")
+    print(f"\n📅 获取 {week_start} ~ {week_end} 的视频（过去 {DAYS_TO_FETCH} 天）\n")
     
     # 收集所有视频
     all_videos = []
     
+    print("=" * 60)
+    print("📺 开始获取各频道视频")
+    print("=" * 60)
+    
     for channel in config['channels']:
-        # channel 可以是 handle（如 @MrBeast）或频道ID
-        if channel.startswith("@") or not channel.startswith("UC"):
-            channel_id = get_channel_id_from_handle(channel)
-            channel_name = channel.lstrip("@")
-        else:
-            channel_id = channel
-            channel_name = channel
+        print(f"\n{'─' * 40}")
+        print(f"处理频道: {channel}")
+        print(f"{'─' * 40}")
+        
+        # 获取频道ID
+        channel_id, channel_name = get_channel_id_from_handle(channel)
         
         if channel_id:
-            videos = get_recent_videos(channel_id, channel_name, days=7)
+            videos = get_recent_videos(channel_id, channel_name, days=DAYS_TO_FETCH)
             all_videos.extend(videos)
+        else:
+            print(f"  ❌ 无法获取频道ID，跳过此频道")
     
-    print(f"\n📊 共找到 {len(all_videos)} 个新视频\n")
+    print(f"\n{'=' * 60}")
+    print(f"📊 共找到 {len(all_videos)} 个新视频")
+    print(f"{'=' * 60}")
     
     # 处理每个视频
     summaries = []
     
-    for video in all_videos:
-        print(f"\n处理: {video['title'][:40]}...")
+    for i, video in enumerate(all_videos, 1):
+        print(f"\n[{i}/{len(all_videos)}] 处理: {video['title'][:50]}...")
         
         # 获取字幕
         transcript = get_transcript(video['id'], video['title'])
@@ -553,16 +599,17 @@ def main():
         })
     
     # 生成邮件内容
-    print("\n📧 生成邮件内容...")
+    print(f"\n{'=' * 60}")
+    print("📧 生成邮件内容...")
     html_content = generate_email_content(summaries, week_start, week_end)
     
     # 发送邮件
-    print("\n📤 发送邮件...")
+    print("📤 发送邮件...")
     send_email(config, html_content, week_start, week_end)
     
-    print("\n" + "=" * 50)
+    print(f"\n{'=' * 60}")
     print("✅ 周报生成完成！")
-    print("=" * 50)
+    print(f"{'=' * 60}")
 
 
 if __name__ == "__main__":
