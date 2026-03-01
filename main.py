@@ -1,5 +1,3 @@
-    #!/usr/bin/env python3
-    YouTube 周报生成器 - 支持Whisper语音识别
 
     import os
     import json
