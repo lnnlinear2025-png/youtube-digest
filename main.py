@@ -21,16 +21,38 @@ import anthropic
 
 def get_config():
     """从环境变量获取配置"""
+    # 调试：打印环境变量状态
+    print("🔍 检查环境变量...")
+    print(f"  ANTHROPIC_API_KEY: {'已设置' if os.environ.get('ANTHROPIC_API_KEY') else '❌ 未设置'}")
+    print(f"  EMAIL_SENDER: {'已设置' if os.environ.get('EMAIL_SENDER') else '❌ 未设置'}")
+    print(f"  EMAIL_PASSWORD: {'已设置' if os.environ.get('EMAIL_PASSWORD') else '❌ 未设置'}")
+    print(f"  EMAIL_RECEIVER: {'已设置' if os.environ.get('EMAIL_RECEIVER') else '❌ 未设置'}")
+    
+    # 获取频道列表
+    channels_str = os.environ.get("YOUTUBE_CHANNELS", "")
+    print(f"  YOUTUBE_CHANNELS: {channels_str if channels_str else '❌ 未设置'}")
+    
+    # 解析频道列表
+    if channels_str:
+        try:
+            channels = json.loads(channels_str)
+        except json.JSONDecodeError as e:
+            print(f"  ❌ YOUTUBE_CHANNELS 格式错误: {e}")
+            print(f"  收到的值: '{channels_str}'")
+            channels = []
+    else:
+        channels = []
+    
     return {
         "email": {
             "sender": os.environ.get("EMAIL_SENDER", ""),
-            "password": os.environ.get("EMAIL_PASSWORD", ""),  # Gmail应用专用密码
+            "password": os.environ.get("EMAIL_PASSWORD", ""),
             "receiver": os.environ.get("EMAIL_RECEIVER", ""),
             "smtp_server": "smtp.gmail.com",
             "smtp_port": 587
         },
         "anthropic_api_key": os.environ.get("ANTHROPIC_API_KEY", ""),
-        "channels": json.loads(os.environ.get("YOUTUBE_CHANNELS", "[]"))
+        "channels": channels
     }
 
 # ============= 核心功能 =============
