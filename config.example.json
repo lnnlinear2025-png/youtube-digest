@@ -1,0 +1,24 @@
+{
+  "_说明": "这是配置示例，实际配置请在GitHub Secrets中设置",
+  
+  "YOUTUBE_CHANNELS": [
+    "@MrBeast",
+    "@TED",
+    "@Fireship",
+    "@3Blue1Brown",
+    "@Kurzgesagt"
+  ],
+  
+  "_频道格式说明": [
+    "方式1: 使用 @用户名，如 @MrBeast",
+    "方式2: 使用频道ID，如 UCX6OQ3DkcsbYNE6H8uQQuVA",
+    "频道ID可以在YouTube频道页面的URL中找到"
+  ],
+  
+  "_如何获取频道handle": [
+    "1. 打开YouTube，进入你想关注的频道",
+    "2. 查看浏览器地址栏",
+    "3. 如果是 youtube.com/@xxxxx 格式，xxxxx就是handle",
+    "4. 如果是 youtube.com/channel/UCxxxxx 格式，UCxxxxx就是频道ID"
+  ]
+}

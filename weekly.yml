@@ -1,0 +1,44 @@
+# YouTube 周报自动化工作流
+# 每周日早上9点（北京时间）自动运行
+
+name: YouTube Weekly Digest
+
+on:
+  # 定时运行：每周日 UTC 1:00 = 北京时间 9:00
+  schedule:
+    - cron: '0 1 * * 0'
+  
+  # 允许手动触发（方便测试）
+  workflow_dispatch:
+
+jobs:
+  generate-digest:
+    runs-on: ubuntu-latest
+    
+    steps:
+      # 1. 检出代码
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      # 2. 设置 Python 环境
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      # 3. 安装依赖
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      # 4. 运行主程序
+      - name: Generate and send digest
+        env:
+          # 这些变量需要在 GitHub Secrets 中设置
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
+          YOUTUBE_CHANNELS: ${{ secrets.YOUTUBE_CHANNELS }}
+        run: python main.py
