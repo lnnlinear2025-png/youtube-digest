@@ -264,40 +264,20 @@ def get_recent_videos(channel_id: str, channel_name: str, days: int = 7) -> list
 def get_transcript(video_id: str, title: str, groq_api_key: str = None) -> str:
     """
     获取视频字幕
-    如果没有字幕，尝试使用Whisper语音识别
     """
-    # 首先尝试获取现有字幕
     try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        # 新版API用法
+        transcript_data = YouTubeTranscriptApi.get_transcript(
+            video_id, 
+            languages=['zh-Hans', 'zh-Hant', 'zh', 'en', 'en-US', 'en-GB']
+        )
+        full_text = " ".join([item['text'] for item in transcript_data])
+        print(f"  📝 获取字幕成功: {title[:30]}... ({len(full_text)} 字符)")
+        return full_text
         
-        preferred_languages = ['zh-Hans', 'zh-Hant', 'zh', 'en', 'en-US', 'en-GB']
-        transcript = None
+    except Exception as e:
+        print(f"  ⚠️ 无可用字幕，尝试语音识别... ({e})")
         
-        for lang in preferred_languages:
-            try:
-                transcript = transcript_list.find_transcript([lang])
-                break
-            except:
-                continue
-        
-        if transcript is None:
-            try:
-                transcript = transcript_list.find_generated_transcript(['zh', 'en'])
-            except:
-                for t in transcript_list:
-                    transcript = t
-                    break
-        
-        if transcript:
-            transcript_data = transcript.fetch()
-            full_text = " ".join([item['text'] for item in transcript_data])
-            print(f"  📝 获取字幕成功: {title[:30]}... ({len(full_text)} 字符)")
-            return full_text
-            
-    except (TranscriptsDisabled, NoTranscriptFound):
-        print(f"  ⚠️ 无可用字幕，尝试语音识别...")
-        
-        # 使用Whisper进行语音识别
         if groq_api_key:
             audio_path = download_audio(video_id, title)
             if audio_path:
@@ -306,9 +286,6 @@ def get_transcript(video_id: str, title: str, groq_api_key: str = None) -> str:
                     return transcript
         else:
             print(f"  ⚠️ 未配置GROQ_API_KEY，跳过语音识别")
-            
-    except Exception as e:
-        print(f"  ❌ 字幕获取失败: {title[:30]}... - {e}")
     
     return None
 
